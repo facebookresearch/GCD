@@ -455,49 +455,53 @@ class Trainer(object):
         """
         params = self.params
         
-        # batch
-        (x1, len1), (x2, len2), _ = self.get_batch(task)
-        # cuda
-        x1, len1, x2, len2 = to_cuda(x1, len1, x2, len2)
+        if params.architecture == "decoder_only":
+            # batch
+            (x2, len2), _ = self.get_batch(task)
+            # cuda
+            x2, len2 = to_cuda(x2, len2)
+        else:
+            # batch
+            (x1, len1), (x2, len2), _ = self.get_batch(task)
+            # cuda
+            x1, len1, x2, len2 = to_cuda(x1, len1, x2, len2)
 
-        # target words to predict
-        alen = torch.arange(len2.max(), dtype=torch.long, device=len2.device)
-        pred_mask = (
-            alen[:, None] < len2[None] - 1
-        )  # do not predict anything given the last target word
-        y = x2[1:].masked_select(pred_mask[:-1])
-        assert len(y) == (len2 - 1).sum().item()
+        if params.architecture != "encoder_only":
+            # target words to predict
+            alen = torch.arange(len2.max(), dtype=torch.long, device=len2.device)
+            pred_mask = (
+                alen[:, None] < len2[None] - 1
+            )  # do not predict anything given the last target word
+            y = x2[1:].masked_select(pred_mask[:-1])
+            assert len(y) == (len2 - 1).sum().item()
+        else: 
+            alen = torch.arange(len1.max(), dtype=torch.long, device=len2.device)
+            pred_mask = (
+                alen[:, None] < len2[None]
+            )
+            y= torch.cat((x2,torch.full((len1.max()-len2.max(),len2.size(0)),self.env.eos_index,device=len2.device)),0)
+            y = y.masked_select(pred_mask)
   
-        encoder = (
-            self.modules["encoder"].module
-            if params.multi_gpu
-            else self.modules["encoder"]
-        )
-        encoder.train()
+        if params.architecture != "decoder_only":
+            encoder = (
+                self.modules["encoder"].module
+                if params.multi_gpu
+                else self.modules["encoder"]
+            )
+            encoder.train()
         
-        decoder = (
-            self.modules["decoder"].module
-            if params.multi_gpu
-            else self.modules["decoder"]
-        )
-        decoder.train()
+        if params.architecture != "encoder_only":
+            decoder = (
+                self.modules["decoder"].module
+                if params.multi_gpu
+                else self.modules["decoder"]
+            )
+            decoder.train()
 
         # forward / loss
-        if params.lstm:
-            if params.amp == -1:
-                _, hidden = encoder("fwd", x=x1, lengths=len1, causal=False)
-                decoded, _ = decoder(
-                    "fwd",
-                    x=x2,
-                    lengths=len2,
-                    causal=True,
-                    src_enc=hidden,
-                )
-                _, loss = decoder(
-                    "predict", tensor=decoded, pred_mask=pred_mask, y=y, get_scores=False
-                )
-            else:
-                with torch.cuda.amp.autocast():
+        if params.architecture == "encoder_decoder":
+            if params.lstm:
+                if params.amp == -1:
                     _, hidden = encoder("fwd", x=x1, lengths=len1, causal=False)
                     decoded, _ = decoder(
                         "fwd",
@@ -507,28 +511,27 @@ class Trainer(object):
                         src_enc=hidden,
                     )
                     _, loss = decoder(
-                        "predict",
-                        tensor=decoded,
-                        pred_mask=pred_mask,
-                        y=y,
-                        get_scores=False,
+                        "predict", tensor=decoded, pred_mask=pred_mask, y=y, get_scores=False
                     )
-        else:
-            if params.amp == -1:
-                encoded = encoder("fwd", x=x1, lengths=len1, causal=False)
-                decoded = decoder(
-                    "fwd",
-                    x=x2,
-                    lengths=len2,
-                    causal=True,
-                    src_enc=encoded.transpose(0, 1),
-                    src_len=len1,
-                )
-                _, loss = decoder(
-                    "predict", tensor=decoded, pred_mask=pred_mask, y=y, get_scores=False
-                )
+                else:
+                    with torch.cuda.amp.autocast():
+                        _, hidden = encoder("fwd", x=x1, lengths=len1, causal=False)
+                        decoded, _ = decoder(
+                            "fwd",
+                            x=x2,
+                            lengths=len2,
+                            causal=True,
+                            src_enc=hidden,
+                        )
+                        _, loss = decoder(
+                            "predict",
+                            tensor=decoded,
+                            pred_mask=pred_mask,
+                            y=y,
+                            get_scores=False,
+                        )
             else:
-                with torch.cuda.amp.autocast():
+                if params.amp == -1:
                     encoded = encoder("fwd", x=x1, lengths=len1, causal=False)
                     decoded = decoder(
                         "fwd",
@@ -537,6 +540,66 @@ class Trainer(object):
                         causal=True,
                         src_enc=encoded.transpose(0, 1),
                         src_len=len1,
+                    )
+                    _, loss = decoder(
+                        "predict", tensor=decoded, pred_mask=pred_mask, y=y, get_scores=False
+                    )
+                else:
+                    with torch.cuda.amp.autocast():
+                        encoded = encoder("fwd", x=x1, lengths=len1, causal=False)
+                        decoded = decoder(
+                            "fwd",
+                            x=x2,
+                            lengths=len2,
+                            causal=True,
+                            src_enc=encoded.transpose(0, 1),
+                            src_len=len1,
+                        )
+                        _, loss = decoder(
+                            "predict",
+                            tensor=decoded,
+                            pred_mask=pred_mask,
+                            y=y,
+                            get_scores=False,
+                        )
+        elif params.architecture == "encoder_only":
+            if params.amp == -1:
+                encoded = encoder("fwd", x=x1, lengths=len1, causal=False)
+                _, loss = encoder(
+                    "predict", tensor=encoded, pred_mask=pred_mask, y=y, get_scores=False
+                )
+            else:
+                with torch.cuda.amp.autocast():
+                    encoded = encoder("fwd", x=x1, lengths=len1, causal=False)
+                    _, loss = encoder(
+                        "predict",
+                        tensor=encoded,
+                        pred_mask=pred_mask,
+                        y=y,
+                        get_scores=False,
+                    )
+        else:
+            if params.amp == -1:
+                decoded = decoder(
+                    "fwd",
+                    x=x2,
+                    lengths=len2,
+                    causal=True,
+                    src_enc=None,
+                    src_len=None,
+                )
+                _, loss = decoder(
+                    "predict", tensor=decoded, pred_mask=pred_mask, y=y, get_scores=False
+                )
+            else:
+                with torch.cuda.amp.autocast():
+                    decoded = decoder(
+                        "fwd",
+                        x=x2,
+                        lengths=len2,
+                        causal=True,
+                        src_enc=None,
+                        src_len=None,
                     )
                     _, loss = decoder(
                         "predict",
@@ -554,5 +617,9 @@ class Trainer(object):
         
         # number of processed sequences / words
         self.n_equations += params.batch_size
-        self.stats["processed_e"] += len1.size(0)
-        self.stats["processed_w"] += (len1 + len2 - 2).sum().item()
+        if params.architecture == "decoder_only":
+            self.stats["processed_e"] += len2.size(0)
+            self.stats["processed_w"] += (len2 - 3).sum().item()
+        else:
+            self.stats["processed_e"] += len1.size(0)
+            self.stats["processed_w"] += (len1 + len2 - 2).sum().item()

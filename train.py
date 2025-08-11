@@ -69,6 +69,8 @@ def get_parser():
                         help="Xavier initialization for transformer parameters")
     parser.add_argument("--gelu_activation", type=bool_flag, default=False,
                         help="GELU initialization in FFN layers (else RELU)")
+    parser.add_argument("--max_src_len", type=int, default=0,
+                        help="Maximum number of tokens to consider in encoder output")
     
     parser.add_argument("--norm_attention", type=bool_flag, default=False,
                         help="Normalize attention and train temperaturee in Transformer")
@@ -80,7 +82,10 @@ def get_parser():
                         help="Share input and output embeddings")
     parser.add_argument("--sinusoidal_embeddings", type=bool_flag, default=False,
                         help="Use sinusoidal embeddings")
-    
+
+    parser.add_argument("--architecture", type=str, default="encoder_decoder",
+                        help="encoder_decoder, encoder_only or decoder_only (last 2 transformer only)")
+
     
     # lstm/GRU
     parser.add_argument("--lstm", type=bool_flag, default=False,

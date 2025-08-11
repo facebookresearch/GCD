@@ -30,6 +30,8 @@ class EnvDataset(Dataset):
         self.global_rank = params.global_rank
         self.count = 0
         self.type = type
+        self.decoder_only = (params.architecture == 'decoder_only')
+        self.encoder_only = (params.architecture == 'encoder_only')
         assert size is None or not self.train
         assert not params.batch_load or params.reload_size > 0
 
@@ -136,11 +138,22 @@ class EnvDataset(Dataset):
         """
         x, y = zip(*elements)
         nb_eqs = [self.env.code_class(xi, yi) for xi, yi in zip(x, y)]
-        x = [torch.LongTensor([self.env.word2id[w] for w in seq]) for seq in x]
-        y = [torch.LongTensor([self.env.word2id[w] for w in seq]) for seq in y]
-        x, x_len = self.batch_sequences(x, self.env.pad_index, self.env.eos_index, self.env.eos_index, True)
-        y, y_len = self.batch_sequences(y, self.env.pad_index, self.env.eos_index, self.env.eos_index, False)
-        return (x, x_len), (y, y_len), torch.LongTensor(nb_eqs)
+        if self.decoder_only:
+            xy = [ xi + ['<sep>'] + yi for xi, yi in zip(x,y)]
+            xy = [torch.LongTensor([self.env.word2id[w] for w in seq]) for seq in xy]
+            xy, xy_len = self.batch_sequences(xy, self.env.pad_index, self.env.eos_index, self.env.eos_index)
+            if self.train:
+                return (xy, xy_len), torch.LongTensor(nb_eqs)
+            else:
+                x = [torch.LongTensor([self.env.word2id[w] for w in seq]) for seq in x]
+                x, x_len = self.batch_sequences(x, self.env.pad_index, self.env.eos_index, self.env.sep_index)
+                return (x, x_len), (xy, xy_len), torch.LongTensor(nb_eqs)
+        else:
+            x = [torch.LongTensor([self.env.word2id[w] for w in seq]) for seq in x]
+            y = [torch.LongTensor([self.env.word2id[w] for w in seq]) for seq in y]
+            x, x_len = self.batch_sequences(x, self.env.pad_index, self.env.eos_index, self.env.eos_index, True)
+            y, y_len = self.batch_sequences(y, self.env.pad_index, self.env.eos_index, self.env.eos_index, True if self.encoder_only else False)
+            return (x, x_len), (y, y_len), torch.LongTensor(nb_eqs)
 
 
     def init_rng(self):

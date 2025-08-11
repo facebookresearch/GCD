@@ -303,6 +303,7 @@ class TransformerModel(nn.Module):
         self.is_encoder = is_encoder
         self.is_decoder = not is_encoder
         self.with_output = with_output
+        self.decoder_only = params.architecture == "decoder_only"
         
         self.xav_init = params.xav_init
 
@@ -318,6 +319,7 @@ class TransformerModel(nn.Module):
         # model parameters
         self.dim = params.enc_emb_dim if is_encoder else params.dec_emb_dim  # 512 by default
         self.src_dim = params.enc_emb_dim
+        self.max_src_len = params.max_src_len
         self.hidden_dim = self.dim * 4  # 2048 by default
         self.n_hidden_layers = params.n_enc_hidden_layers if is_encoder else params.n_dec_hidden_layers
         self.n_heads = params.n_enc_heads if is_encoder else params.n_dec_heads  # 8 by default
@@ -402,10 +404,16 @@ class TransformerModel(nn.Module):
         mask, attn_mask = get_masks(slen, lengths, causal)
         src_mask = None
         if self.is_decoder and (src_enc is not None):
-            src_mask = (
-                torch.arange(src_len.max(), dtype=torch.long, device=lengths.device)
-                < src_len[:, None]
-            )
+            if self.max_src_len > 0:
+                src_mask = (
+                    torch.arange(src_len.max(), dtype=torch.long, device=lengths.device)
+                    < torch.clamp(src_len[:, None], max=self.max_src_len)
+                )
+            else:
+                src_mask = (
+                    torch.arange(src_len.max(), dtype=torch.long, device=lengths.device)
+                    < src_len[:, None]
+                )
         
         # positions
         if positions is None:
@@ -467,6 +475,28 @@ class TransformerModel(nn.Module):
         loss = F.cross_entropy(scores.float(), y, reduction="mean")
         return scores, loss
 
+    def decode(self, src_enc, src_len, exp_len):
+         # input batch
+        bs = len(src_len)
+        assert src_enc.size(1) == bs
+
+        # generated sentences
+        max_len = src_enc.size(0)
+
+        tensor = self.fwd(x=src_enc, lengths=src_len, causal=False)
+        assert tensor.size() == (max_len, bs, self.dim)
+        scores = self.proj(tensor)  # (len, bs, n_words)
+        # select next words: sample or greedy
+        sample_temperature = None
+        if sample_temperature is None:
+            next_words = torch.topk(scores, 1)[1].squeeze(2)
+        else:
+            next_words = torch.multinomial(
+                F.softmax(scores.float() / sample_temperature, dim=1), 1
+            ).squeeze(2)
+        assert next_words.size() == (max_len, bs,)
+        next_words = next_words[:exp_len] 
+        return next_words.transpose(0,1)
 
     def generate(self, src_enc, src_len, max_len=200, sample_temperature=None):
         """
@@ -490,7 +520,14 @@ class TransformerModel(nn.Module):
         generated = src_len.new(max_len, bs)  # upcoming output
         generated.fill_(self.pad_index)  # fill upcoming ouput with <PAD>
         # current position / max lengths / length of generated sentences 
-        generated[0].fill_(self.eos_index)  # we use <EOS> for <BOS> everywhere
+        if self.decoder_only:
+            max_src = src_len.max()
+            generated[:max_src] = src_enc
+            generated[max_src-1] = self.sep_index
+        #    cur_len = src_len.min()
+        #    gen_len = src_len.clone().fill_(cur_len)
+        else:
+            generated[0].fill_(self.eos_index)  # we use <EOS> for <BOS> everywhere
         cur_len = 1
         gen_len = src_len.clone().fill_(1)
 
@@ -508,16 +545,32 @@ class TransformerModel(nn.Module):
         while cur_len < max_len:
 
             # compute word scores
-            tensor = self.forward(
-                "fwd",
-                x=generated[:cur_len],
-                lengths=gen_len,
-                positions=positions[:cur_len],
-                causal=True,
-                src_enc=src_enc,
-                src_len=src_len,
-                use_cache=True,
-            )
+            if self.decoder_only:
+                # compute word scores
+                tensor = self.forward(
+                    "fwd",
+                    x=generated[:cur_len],
+                    lengths=gen_len,
+                    positions=positions[:cur_len],
+                    causal=True,
+                    src_enc=None,
+                    src_len=None,
+                    use_cache=True,
+                )
+                # logger.info((f"before {tensor.size()}"))
+                # tensor = tensor[cur_len - 1]
+                # logger.info((f"after {tensor.size()}"))
+            else:
+                tensor = self.forward(
+                    "fwd",
+                    x=generated[:cur_len],
+                    lengths=gen_len,
+                    positions=positions[:cur_len],
+                    causal=True,
+                    src_enc=src_enc,
+                    src_len=src_len,
+                    use_cache=True,
+                )
             assert tensor.size() == (1, bs, self.dim)
             tensor = tensor.data[-1, :, :] # .to(self.dtype)  # (bs, dim)
             scores = self.proj(tensor)  # (bs, n_words)
@@ -532,11 +585,20 @@ class TransformerModel(nn.Module):
             assert next_words.size() == (bs,)
 
             # update generations / lengths / finished sentences / current length
-            generated[cur_len] = next_words * unfinished_sents + self.pad_index * (
-                1 - unfinished_sents
-            )
-            gen_len.add_(unfinished_sents)
-            unfinished_sents.mul_(next_words.ne(self.eos_index).long())
+            if self.decoder_only:
+                up_mask = (src_len <= cur_len)
+                to_update = unfinished_sents * up_mask 
+                generated[cur_len] = next_words * to_update + (1 - to_update) * (
+                    generated[cur_len] * ~up_mask + self.pad_index * up_mask
+                )
+                gen_len.add_(unfinished_sents)
+                unfinished_sents.mul_((~up_mask).long() + up_mask * next_words.ne(self.eos_index).long())
+            else:
+                generated[cur_len] = next_words * unfinished_sents + self.pad_index * (
+                    1 - unfinished_sents
+                )
+                gen_len.add_(unfinished_sents)
+                unfinished_sents.mul_(next_words.ne(self.eos_index).long())
 
             cur_len = cur_len + 1
 

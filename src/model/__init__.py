@@ -33,18 +33,29 @@ def build_modules(env, params):
     """
     Build modules.
     """
+    assert params.architecture in ["encoder_decoder","encoder_only","decoder_only"]
+    assert not params.lstm or params.architecture == "encoder_decoder" 
     modules = {}
-    if params.lstm:
-        modules["encoder"] = LSTMModel(
-            params, env.id2word, is_encoder=True, with_output=False
-        )
-        modules["decoder"] = LSTMModel(
-            params, env.id2word, is_encoder=False, with_output=True
+    if params.architecture == "encoder_decoder":
+        if params.lstm:
+            modules["encoder"] = LSTMModel(
+                params, env.id2word, is_encoder=True, with_output=False
+            )
+            modules["decoder"] = LSTMModel(
+                params, env.id2word, is_encoder=False, with_output=True
+            )
+        else:
+            modules["encoder"] = TransformerModel(
+                params, env.id2word, is_encoder=True, with_output=False
+            )
+            modules["decoder"] = TransformerModel(
+                params, env.id2word, is_encoder=False, with_output=True
+            )
+    elif params.architecture == "encoder_only":
+        modules["encoder"] = TransformerModel(
+            params, env.id2word, is_encoder=True, with_output=True
         )
     else:
-        modules["encoder"] = TransformerModel(
-            params, env.id2word, is_encoder=True, with_output=False
-        )
         modules["decoder"] = TransformerModel(
             params, env.id2word, is_encoder=False, with_output=True
         )

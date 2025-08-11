@@ -103,18 +103,20 @@ class Evaluator(object):
         params = self.params
         env = self.env
         max_beam_length = params.max_output_len + 2
-        encoder = (
-            self.modules["encoder"].module
-            if params.multi_gpu
-            else self.modules["encoder"]
-        )
-        encoder.eval()
-        decoder = (
-            self.modules["decoder"].module
-            if params.multi_gpu
-            else self.modules["decoder"]
-        )
-        decoder.eval()
+        if params.architecture != "decoder_only":
+            encoder = (
+                self.modules["encoder"].module
+                if params.multi_gpu
+                else self.modules["encoder"]
+            )
+            encoder.eval()
+        if params.architecture != "encoder_only":
+            decoder = (
+                self.modules["decoder"].module
+                if params.multi_gpu
+                else self.modules["decoder"]
+            )
+            decoder.eval()
         assert params.eval_verbose in [0, 1,2]
         assert params.eval_verbose_print is False or params.eval_verbose > 0
         assert task in env.TRAINING_TASKS
@@ -174,38 +176,57 @@ class Evaluator(object):
             # cuda
             x1_, len1_, x2, len2 = to_cuda(x1, len1, x2, len2)
             # target words to predict
-            alen = torch.arange(len2.max(), dtype=torch.long, device=len2.device)
-            pred_mask = (
-                alen[:, None] < len2[None] - 1
-            )  # do not predict anything given the last target word
-            y = x2[1:].masked_select(pred_mask[:-1])
-            assert len(y) == (len2 - 1).sum().item()
+            if params.architecture != "encoder_only":
+                alen = torch.arange(len2.max(), dtype=torch.long, device=len2.device)
+                pred_mask = (
+                    alen[:, None] < len2[None] - 1
+                )  # do not predict anything given the last target word
+                y = x2[1:].masked_select(pred_mask[:-1])
+                assert len(y) == (len2 - 1).sum().item()
+            else: 
+                alen = torch.arange(len1_.max(), dtype=torch.long, device=len2.device)
+                pred_mask = (
+                    alen[:, None] < len2[None]
+                )
+                y= torch.cat((x2,torch.full((len1_.max()-len2.max(),len2.size(0)),self.env.eos_index,device=len2.device)),0)
+                y = y.masked_select(pred_mask)
 
             bs = len(len1_)
 
             # forward / loss
-            if params.lstm:
-                _, hidden = encoder("fwd", x=x1_, lengths=len1_, causal=False)
-                decoded, _ = decoder(
-                    "fwd",
-                    x=x2,
-                    lengths=len2,
-                    causal=True,
-                    src_enc=hidden,
-                )
-                word_scores, loss = decoder(
-                    "predict", tensor=decoded, pred_mask=pred_mask, y=y, get_scores=True
+            if params.architecture == "encoder_decoder":
+                if params.lstm:
+                    _, hidden = encoder("fwd", x=x1_, lengths=len1_, causal=False)
+                    decoded, _ = decoder(
+                        "fwd",
+                        x=x2,
+                        lengths=len2,
+                        causal=True,
+                        src_enc=hidden,
+                    )
+                    word_scores, loss = decoder(
+                        "predict", tensor=decoded, pred_mask=pred_mask, y=y, get_scores=True
+                    )
+                else:
+                    encoded = encoder("fwd", x=x1_, lengths=len1_, causal=False)
+                    decoded = decoder(
+                        "fwd",
+                        x=x2,
+                        lengths=len2,
+                        causal=True,
+                        src_enc=encoded.transpose(0, 1),
+                        src_len=len1_,
+                    )
+                    word_scores, loss = decoder(
+                        "predict", tensor=decoded, pred_mask=pred_mask, y=y, get_scores=True
+                    )
+            elif params.architecture == "encoder_only":
+                encoded = encoder("fwd", x=x1_, lengths=len1_, causal=False)
+                word_scores, loss = encoder(
+                    "predict", tensor=encoded, pred_mask=pred_mask, y=y, get_scores=True
                 )
             else:
-                encoded = encoder("fwd", x=x1_, lengths=len1_, causal=False)
-                decoded = decoder(
-                    "fwd",
-                    x=x2,
-                    lengths=len2,
-                    causal=True,
-                    src_enc=encoded.transpose(0, 1),
-                    src_len=len1_,
-                )
+                decoded = decoder("fwd", x=x2, lengths=len2, causal=True, src_enc=None, src_len=None)
                 word_scores, loss = decoder(
                     "predict", tensor=decoded, pred_mask=pred_mask, y=y, get_scores=True
                 )
@@ -213,15 +234,22 @@ class Evaluator(object):
             # correct outputs per sequence / valid top-1 predictions
             t = torch.zeros_like(pred_mask, device=y.device)
             t[pred_mask] += word_scores.max(1)[1] == y
-            valid = (t.sum(0) == len2 - 1).cpu().long()
+            if params.architecture == "encoder_only":
+                valid = (t.sum(0) == len2).cpu().long()
+            else:
+                valid = (t.sum(0) == len2 - 1).cpu().long()
             n_perfect_match += valid.sum().item()
 
             # export evaluation details
             beam_log = {}
             for i in range(len(len1)):
-                out_offset = 1
-                src = idx_to_infix(env, x1[0 : len1[i] - 1, i].tolist(), True)
-                tgt = idx_to_infix(env, x2[out_offset : len2[i] - 1, i].tolist(), False)
+                if params.architecture == "decoder_only":
+                    src = idx_to_infix(env, x2[1 : len1[i] - 1, i].tolist(), True)
+                    tgt = idx_to_infix(env, x2[len1[i] : len2[i] - 1, i].tolist(), False)
+                else:
+                    out_offset = 0 if params.architecture == "encoder_only" else 1
+                    src = idx_to_infix(env, x1[0 : len1[i] - 1, i].tolist(), True)
+                    tgt = idx_to_infix(env, x2[out_offset : len2[i] - 1, i].tolist(), False)
                 if valid[i]:
                     beam_log[i] = {"src": src, "tgt": tgt, "hyps": [(tgt, None, True)]}
                     result = (nb_ops[i] % 1000) if (nb_ops[i] % 1000) < 101 else 101
@@ -247,19 +275,25 @@ class Evaluator(object):
             )
 
             # generate
-            if params.lstm:
-                generated, _ = decoder.generate(
-                    hidden,
-                    len1_,
-                    max_len=max_beam_length,
-                )
-            else:
-                generated, _ = decoder.generate(
-                    encoded.transpose(0, 1),
-                    len1_,
-                    max_len=max_beam_length,
-                )
-                generated=generated.transpose(0, 1)
+            if params.architecture == "encoder_decoder":
+                if params.lstm:
+                    generated, _ = decoder.generate(
+                        hidden,
+                        len1_,
+                        max_len=max_beam_length,
+                    )
+                else:
+                    generated, _ = decoder.generate(
+                        encoded.transpose(0, 1),
+                        len1_,
+                        max_len=max_beam_length,
+                    )
+                    generated=generated.transpose(0, 1)
+            elif params.architecture == "encoder_only":
+                generated = encoder.decode(x1_, len1_, max_beam_length)
+            else: 
+                generated, _ = decoder.generate(x1_, len1_, max_beam_length)
+                generated = generated.transpose(0, 1)
             
             # prepare inputs / hypotheses to check
             # if eval_verbose < 2, no beam search on equations solved greedily
@@ -267,16 +301,27 @@ class Evaluator(object):
             for i in range(len(generated)):
                 if valid[i] and params.eval_verbose < 2:
                     continue
-                out_offset = 1
-                inputs.append(
-                    {
-                        "i": i,
-                        "src": x1[0 : len1[i] - 1, i].tolist(),
-                        "tgt": x2[out_offset : len2[i] - 1, i].tolist(),
-                        "hyp": generated[i][out_offset:].tolist(),
-                        "task": task,
-                    }
-                )
+                if params.architecture == "decoder_only":
+                    inputs.append(
+                        {
+                            "i": i,
+                            "src": x2[1 : len1[i] - 1, i].tolist(),
+                            "tgt": x2[len1[i] : len2[i] - 1, i].tolist(),
+                            "hyp": generated[i][len1[i]:].tolist(),
+                            "task": task,
+                        }
+                    )
+                else:
+                    out_offset = 0 if params.architecture == "encoder_only" else 1
+                    inputs.append(
+                        {
+                            "i": i,
+                            "src": x1[0 : len1[i] - 1, i].tolist(),
+                            "tgt": x2[out_offset : len2[i] - 1, i].tolist(),
+                            "hyp": generated[i][out_offset:].tolist(),
+                            "task": task,
+                        }
+                    )
 
             # check hypotheses with multiprocessing
             outputs = []
